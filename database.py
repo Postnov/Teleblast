@@ -52,7 +52,19 @@ class Database:
             PRIMARY KEY (broadcast_id, chat_id)
         )
         """)
+        await self.conn.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            added_by INTEGER,
+            super_admin INTEGER DEFAULT 0
+        )
+        """)
         await self.conn.commit()
+        # Проверяем и добавляем поле super_admin если его нет
+        await self._migrate_add_super_admin_field()
 
     async def _migrate_add_deleted_field(self):
         """Миграция для добавления поля deleted в таблицу broadcasts"""
@@ -68,6 +80,19 @@ class Database:
                 print("✅ Поле 'deleted' добавлено в таблицу broadcasts")
         except Exception as e:
             print(f"❌ Ошибка миграции: {e}")
+
+    async def _migrate_add_super_admin_field(self):
+        """Миграция для добавления поля super_admin в таблицу admins"""
+        try:
+            cursor = await self.conn.execute("PRAGMA table_info(admins)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            if 'super_admin' not in column_names:
+                await self.conn.execute("ALTER TABLE admins ADD COLUMN super_admin INTEGER DEFAULT 0")
+                await self.conn.commit()
+                print("✅ Поле 'super_admin' добавлено в таблицу admins")
+        except Exception as e:
+            print(f"❌ Ошибка миграции super_admin: {e}")
 
     async def create_list(self, name: str):
         await self.conn.execute("INSERT OR IGNORE INTO lists(name) VALUES (?)", (name,))
@@ -263,4 +288,62 @@ class Database:
             "UPDATE broadcasts SET deleted = 1 WHERE id = ?",
             (broadcast_id,)
         )
+        await self.conn.commit()
+
+    # ---- Методы для работы с админами ---- #
+
+    async def add_admin(self, user_id: int, username: str = None, first_name: str = None, added_by: int = None, super_admin: int = 0):
+        """Добавить администратора"""
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO admins (user_id, username, first_name, added_by, super_admin) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, first_name, added_by, super_admin)
+        )
+        await self.conn.commit()
+
+    async def remove_admin(self, user_id: int):
+        """Удалить администратора"""
+        await self.conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+        await self.conn.commit()
+
+    async def is_admin(self, user_id: int) -> bool:
+        """Проверить, является ли пользователь администратором"""
+        cursor = await self.conn.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row is not None
+
+    async def is_super_admin(self, user_id: int) -> bool:
+        cursor = await self.conn.execute("SELECT super_admin FROM admins WHERE user_id = ?", (user_id,))
+        row = await cursor.fetchone()
+        return row is not None and row[0] == 1
+
+    async def get_all_admins(self):
+        """Получить всех администраторов"""
+        cursor = await self.conn.execute(
+            "SELECT user_id, username, first_name, added_at FROM admins ORDER BY added_at"
+        )
+        return await cursor.fetchall()
+
+    async def set_super_admin(self, new_super_id: int):
+        """Передает статус супер админа другому пользователю"""
+        # Снимаем текущий супер флаг
+        await self.conn.execute("UPDATE admins SET super_admin = 0 WHERE super_admin = 1")
+        # Назначаем нового
+        await self.conn.execute("UPDATE admins SET super_admin = 1 WHERE user_id = ?", (new_super_id,))
+        await self.conn.commit()
+
+    async def migrate_admins_from_config(self, admin_ids: list):
+        """Миграция админов из конфига в базу данных"""
+        # Проверяем, есть ли уже супер-администратор в базе
+        cursor = await self.conn.execute("SELECT user_id FROM admins WHERE super_admin = 1 LIMIT 1")
+        row = await cursor.fetchone()
+        has_super = row is not None
+
+        for idx, admin_id in enumerate(admin_ids):
+            # Если супер-админ уже есть – не назначаем нового при миграции
+            super_flag = 1 if (idx == 0 and not has_super) else 0
+            if not await self.is_admin(admin_id):
+                await self.add_admin(admin_id, username="from_config", first_name="Legacy Admin", super_admin=super_flag)
+            else:
+                if super_flag == 1:
+                    await self.set_super_admin(admin_id)
         await self.conn.commit() 

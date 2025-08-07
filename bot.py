@@ -197,13 +197,27 @@ class MenuState(StatesGroup):
     edit_ai_input = State()
     edit_ai_confirm = State()
 
+    # управление админами
+    settings_menu = State()
+    admin_management = State()
+    admin_add_wait_user = State()
+    admin_delete_select = State()
+    admin_delete_confirm = State()
+    admin_transfer_select = State()
+    admin_transfer_confirm = State()
+
 
 
 
 # ---- Вспомогательные функции ---- #
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+async def is_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором в базе данных"""
+    return await db.is_admin(user_id)
+
+async def is_super_admin(user_id: int) -> bool:
+    """Проверяет, является ли пользователь супер-админом"""
+    return await db.is_super_admin(user_id)
 
 
 def admin_required(func):
@@ -214,7 +228,7 @@ def admin_required(func):
     allowed_params = set(sig.parameters.keys())
 
     async def wrapper(message: types.Message, *args, **kwargs):
-        if not is_admin(message.from_user.id):
+        if not await is_admin(message.from_user.id):
             await message.answer("⛔️ У вас нет доступа к этой команде.")
             return
         # Оставляем только те kwargs, которые реально есть в целевой функции
@@ -280,7 +294,7 @@ async def send_long_message_with_keyboard(message: types.Message, text: str, rep
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    if is_admin(message.from_user.id):
+    if await is_admin(message.from_user.id):
         await message.answer(
             "🏠 Добро пожаловать в админ-панель бота!\n\n"
             "Используйте кнопки ниже для управления ⬇️",
@@ -297,7 +311,7 @@ async def cmd_myid(message: types.Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
-    if is_admin(message.from_user.id):
+    if await is_admin(message.from_user.id):
         await message.answer(
             (
                 "🔧 <b>Команды администратора:</b>\n\n"
@@ -512,7 +526,7 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     kb.button(text="📢 Рассылка")
     kb.button(text="📂 Сегменты")
     kb.button(text="🎓 Группы") 
-    kb.button(text="⚙️ Управление")
+    kb.button(text="⚙️ Настройки")
     kb.adjust(2, 2)  # два ряда
     return kb.as_markup(resize_keyboard=True, persistent=True)
 
@@ -860,11 +874,398 @@ async def process_group_add_list(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# Управление — покажем /help
-@dp.message(F.text == "⚙️ Управление")
+# Настройки
+@dp.message(F.text == "⚙️ Настройки")
 @admin_required
-async def handle_management_button(message: types.Message):
-    await cmd_help(message)
+async def handle_settings_button(message: types.Message, state: FSMContext):
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="👑 Управление админами")
+    kb.button(text="📋 Справка")
+    kb.button(text="⬅️ Назад")
+    kb.adjust(1)
+    
+    await message.answer(
+        "⚙️ <b>Настройки бота</b>\n\n"
+        "Выберите раздел для настройки:",
+        reply_markup=kb.as_markup(resize_keyboard=True)
+    )
+    await state.set_state(MenuState.settings_menu)
+
+
+# --- Обработчики меню настроек --- #
+
+@dp.message(MenuState.settings_menu)
+@admin_required
+async def process_settings_menu(message: types.Message, state: FSMContext):
+    txt = message.text or ""
+    
+    if txt == "⬅️ Назад":
+        await state.clear()
+        await message.answer("🏠 Вернулись в главное меню", reply_markup=admin_reply_keyboard())
+        return
+    
+    if txt == "👑 Управление админами":
+        # Получаем список всех админов
+        admins = await db.get_all_admins()
+        current_id = message.from_user.id
+        current_is_super = await is_super_admin(current_id)
+
+        # Обновляем данные о каждом админе, если имя/ник неизвестны
+        enriched_admins = []
+        for user_id, username, first_name, added_at in admins:
+            if not username or username == "from_config" or not first_name or first_name == "Legacy Admin":
+                try:
+                    user_chat = await bot.get_chat(user_id)
+                    username = user_chat.username or username
+                    first_name = user_chat.first_name or first_name
+                    # сохраняем обновлённые данные
+                    super_flag = 1 if await db.is_super_admin(user_id) else 0
+                    await db.add_admin(user_id, username, first_name, super_admin=super_flag)
+                except Exception:
+                    pass
+            enriched_admins.append((user_id, username, first_name, added_at))
+        admins = enriched_admins
+
+        text = "👑 <b>Управление администраторами</b>\n\n"
+        visible_admins = []
+        for user_id, username, first_name, added_at in admins:
+            # Скрываем супер админа от других обычных администраторов
+            if await db.is_super_admin(user_id) and user_id != current_id:
+                continue
+            visible_admins.append((user_id, username, first_name, added_at))
+        
+        if visible_admins:
+            text += "📋 <b>Текущие администраторы:</b>\n"
+            for user_id, username, first_name, added_at in visible_admins:
+                if user_id == current_id:
+                    name = "Вы"
+                else:
+                    name = f"{first_name or 'Неизвестно'}"
+                    if username and username != "from_config":
+                        name += f" (@{username})"
+                if await db.is_super_admin(user_id):
+                    name += " 🔑"
+                text += f"• {name} (ID: <code>{user_id}</code>)\n"
+            text += f"\n📊 Всего админов: {len(visible_admins)}"
+        else:
+            text += "❌ Нет администраторов для отображения"
+        
+        text += "\n\nВыберите действие:"
+        
+        kb = ReplyKeyboardBuilder()
+        kb.button(text="➕ Добавить админа")
+        if len(visible_admins) > 1:
+            kb.button(text="❌ Удалить админа")
+        if current_is_super:
+            kb.button(text="🔑 Передать суперправа")
+        kb.button(text="⬅️ Назад")
+        kb.adjust(2, 1)
+        
+        await message.answer(text, reply_markup=kb.as_markup(resize_keyboard=True))
+        await state.set_state(MenuState.admin_management)
+        return
+    
+    if txt == "📋 Справка":
+        await cmd_help(message)
+        return
+    
+    await message.answer("Пожалуйста, используйте кнопки.")
+
+
+# --- Управление админами --- #
+
+@dp.message(MenuState.admin_management)
+@admin_required
+async def process_admin_management(message: types.Message, state: FSMContext):
+    txt = message.text or ""
+    
+    if txt == "⬅️ Назад":
+        await handle_settings_button(message, state)
+        return
+    
+    if txt == "➕ Добавить админа":
+        await message.answer(
+            "👥 Выберите пользователя для назначения администратором:\n\n"
+            "• Нажмите кнопку ниже\n"
+            "• Выберите пользователя из списка контактов\n"
+            "• Убедитесь, что у пользователя есть диалог с ботом",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(
+                        text="👤 Выбрать пользователя",
+                        request_user=types.KeyboardButtonRequestUser(
+                            request_id=1,
+                            user_is_bot=False
+                        )
+                    )],
+                    [KeyboardButton(text="❌ Отмена")]
+                ],
+                resize_keyboard=True
+            )
+        )
+        await state.set_state(MenuState.admin_add_wait_user)
+        return
+    
+    if txt == "🔑 Передать суперправа":
+            # список админов без текущего
+        admins = await db.get_all_admins()
+        selectable = [(uid, uname, fname) for uid, uname, fname, _ in admins if uid != message.from_user.id]
+        if not selectable:
+            await message.answer("❌ Нет админов для передачи прав.")
+            return
+        kb = ReplyKeyboardBuilder()
+        for uid, uname, fname in selectable:
+            name = f"{fname or 'Неизвестно'}"
+            if uname:
+                name += f" (@{uname})"
+            kb.button(text=f"🔑 {name}")
+        kb.button(text="❌ Отмена")
+        kb.adjust(1)
+        await message.answer("Выберите администратора, которому передать суперправа:", reply_markup=kb.as_markup(resize_keyboard=True))
+        await state.update_data(selectable_admins=selectable)
+        await state.set_state(MenuState.admin_transfer_select)
+        return
+
+    if txt == "❌ Удалить админа":
+        admins = await db.get_all_admins()
+        if not admins:
+            await message.answer("❌ Нет админов для удаления.")
+            return
+        
+        # Проверяем, что не остается только один админ
+        if len(admins) <= 1:
+            await message.answer("⚠️ Нельзя удалить последнего администратора!")
+            return
+        
+        text = "❌ <b>Удаление администратора</b>\n\n"
+        text += "Выберите администратора для удаления:\n\n"
+        
+        kb = ReplyKeyboardBuilder()
+        for user_id, username, first_name, added_at in admins:
+            # Пропускаем супер админа и самого себя
+            if await db.is_super_admin(user_id):
+                continue
+            if user_id == message.from_user.id:
+                continue
+                
+            name = f"{first_name or 'Неизвестно'}"
+            if username:
+                name += f" (@{username})"
+            kb.button(text=f"🗑 {name}")
+        
+        kb.button(text="❌ Отмена")
+        kb.adjust(1)
+        
+        if len([admin for admin in admins if admin[0] != message.from_user.id]) == 0:
+            await message.answer("⚠️ Вы не можете удалить себя из админов!")
+            return
+        
+        await message.answer(text, reply_markup=kb.as_markup(resize_keyboard=True))
+        await state.update_data(available_admins=admins)
+        await state.set_state(MenuState.admin_delete_select)
+        return
+    
+    await message.answer("Пожалуйста, используйте кнопки.")
+
+
+# --- Добавление админа --- #
+
+@dp.message(lambda m: m.user_shared is not None)
+@admin_required
+async def handle_user_shared(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state != MenuState.admin_add_wait_user:
+        return
+    
+    user_id = message.user_shared.user_id
+    
+    # Проверяем, не является ли пользователь уже админом
+    if await db.is_admin(user_id):
+        await message.answer("⚠️ Этот пользователь уже является администратором!")
+        return
+    
+    try:
+        # Пытаемся получить информацию о пользователе
+        user = await bot.get_chat(user_id)
+        username = user.username
+        first_name = user.first_name
+    except Exception:
+        username = None
+        first_name = None
+    
+    # Добавляем админа
+    await db.add_admin(user_id, username, first_name, message.from_user.id)
+    
+    name = f"{first_name or 'Неизвестно'}"
+    if username:
+        name += f" (@{username})"
+    
+    await message.answer(
+        f"✅ Пользователь {name} (ID: <code>{user_id}</code>) назначен администратором!",
+        reply_markup=admin_reply_keyboard()
+    )
+    await state.clear()
+
+
+@dp.message(MenuState.admin_add_wait_user)
+@admin_required
+async def process_admin_add_cancel(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await message.answer("✅ Добавление админа отменено.", reply_markup=admin_reply_keyboard())
+        await state.clear()
+        return
+    
+    await message.answer("Пожалуйста, используйте кнопку для выбора пользователя.")
+
+
+# --- Удаление админа --- #
+
+@dp.message(MenuState.admin_delete_select)
+@admin_required
+async def process_admin_delete_select(message: types.Message, state: FSMContext):
+    txt = message.text or ""
+    
+    if txt == "❌ Отмена":
+        await message.answer("✅ Удаление админа отменено.", reply_markup=admin_reply_keyboard())
+        await state.clear()
+        return
+    
+    if not txt.startswith("🗑 "):
+        await message.answer("Пожалуйста, выберите админа из списка.")
+        return
+    
+    admin_name = txt[2:].strip()
+    data = await state.get_data()
+    available_admins = data.get("available_admins", [])
+    
+    # Находим выбранного админа
+    selected_admin = None
+    for user_id, username, first_name, added_at in available_admins:
+        name = f"{first_name or 'Неизвестно'}"
+        if username:
+            name += f" (@{username})"
+        if name == admin_name:
+            selected_admin = (user_id, username, first_name, added_at)
+            break
+    
+    if not selected_admin:
+        await message.answer("❌ Админ не найден.")
+        return
+    
+    user_id, username, first_name, _ = selected_admin
+    name = f"{first_name or 'Неизвестно'}"
+    if username:
+        name += f" (@{username})"
+    
+    await state.update_data(admin_to_delete=selected_admin)
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Да, удалить"), KeyboardButton(text="❌ Нет, отмена")]
+        ],
+        resize_keyboard=True
+    )
+    
+    await message.answer(
+        f"⚠️ <b>Подтвердите удаление</b>\n\n"
+        f"Вы действительно хотите удалить из администраторов пользователя:\n"
+        f"👤 {name} (ID: <code>{user_id}</code>)?",
+        reply_markup=kb
+    )
+    await state.set_state(MenuState.admin_delete_confirm)
+
+
+@dp.message(MenuState.admin_delete_confirm)
+@admin_required
+async def process_admin_delete_confirm(message: types.Message, state: FSMContext):
+    txt = message.text or ""
+    
+    if txt == "❌ Нет, отмена":
+        await message.answer("✅ Удаление админа отменено.", reply_markup=admin_reply_keyboard())
+        await state.clear()
+        return
+    
+    if txt == "✅ Да, удалить":
+        data = await state.get_data()
+        admin_to_delete = data.get("admin_to_delete")
+        
+        if not admin_to_delete:
+            await message.answer("❌ Ошибка: данные админа потеряны.")
+            await state.clear()
+            return
+        
+        user_id, username, first_name, _ = admin_to_delete
+        name = f"{first_name or 'Неизвестно'}"
+        if username:
+            name += f" (@{username})"
+        
+        # Удаляем админа
+        await db.remove_admin(user_id)
+        
+        await message.answer(
+            f"✅ Администратор {name} (ID: <code>{user_id}</code>) успешно удален!",
+            reply_markup=admin_reply_keyboard()
+        )
+        await state.clear()
+        return
+    
+    await message.answer("Пожалуйста, используйте кнопки для ответа.")
+
+
+# --- Передача суперправ --- #
+
+@dp.message(MenuState.admin_transfer_select)
+@admin_required
+async def process_admin_transfer_select(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await message.answer("✅ Передача суперправ отменена.", reply_markup=admin_reply_keyboard())
+        await state.clear()
+        return
+    if not message.text.startswith("🔑 "):
+        await message.answer("Пожалуйста, выберите админа из списка.")
+        return
+    admin_name = message.text[2:].strip()
+    data = await state.get_data()
+    selectable = data.get("selectable_admins", [])
+    selected = None
+    for uid, uname, fname in selectable:
+        name = f"{fname or 'Неизвестно'}"
+        if uname:
+            name += f" (@{uname})"
+        if name == admin_name:
+            selected = (uid, uname, fname)
+            break
+    if not selected:
+        await message.answer("❌ Админ не найден.")
+        return
+    uid, uname, fname = selected
+    name = f"{fname or 'Неизвестно'}"
+    if uname:
+        name += f" (@{uname})"
+    await state.update_data(new_super_admin=uid)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Да, передать"), KeyboardButton(text="❌ Нет, отмена")]], resize_keyboard=True)
+    await message.answer(f"⚠️ Подтвердите передачу суперправ пользователю {name}. Вы потеряете статус супер админа.", reply_markup=kb)
+    await state.set_state(MenuState.admin_transfer_confirm)
+
+@dp.message(MenuState.admin_transfer_confirm)
+@admin_required
+async def process_admin_transfer_confirm(message: types.Message, state: FSMContext):
+    if message.text == "❌ Нет, отмена":
+        await message.answer("✅ Передача суперправ отменена.", reply_markup=admin_reply_keyboard())
+        await state.clear()
+        return
+    if message.text == "✅ Да, передать":
+        data = await state.get_data()
+        new_uid = data.get("new_super_admin")
+        if not new_uid:
+            await message.answer("❌ Ошибка передачи прав.")
+            await state.clear()
+            return
+        await db.set_super_admin(new_uid)
+        await message.answer("✅ Суперправа успешно переданы!", reply_markup=admin_reply_keyboard())
+        await state.clear()
+        return
+    await message.answer("Пожалуйста, используйте кнопки.")
 
 
 # --- Редактирование группы --- #
@@ -1309,6 +1710,11 @@ async def main():
         # Инициализация БД
         await db.init()
         logger.info("База данных инициализирована")
+
+        # Миграция админов из конфига в базу данных
+        if ADMIN_IDS:
+            await db.migrate_admins_from_config(ADMIN_IDS)
+            logger.info(f"Перенесено {len(ADMIN_IDS)} админов из конфига в базу данных")
 
 
 

@@ -1,7 +1,7 @@
 # Makefile для управления TeleBlast
 # Используй: make <команда>
 
-.PHONY: help start-bot stop-bot restart-bot start-webapp stop-webapp restart-webapp status logs clean install setup create-venv force-stop kill-safe kill-remake cleanup-pids
+.PHONY: help start-bot stop-bot restart-bot start-webapp stop-webapp restart-webapp status logs clean install setup create-venv force-stop kill-safe kill-teleblast cleanup-pids
 
 # Цвета для вывода
 GREEN=\033[0;32m
@@ -10,7 +10,7 @@ RED=\033[0;31m
 NC=\033[0m # No Color
 
 # Рабочая директория проекта
-PROJECT_DIR := /home/remake-bot
+PROJECT_DIR := /home/teleblast
 BOT_PIDFILE := $(PROJECT_DIR)/bot.pid
 WEBAPP_PIDFILE := $(PROJECT_DIR)/webapp.pid
 
@@ -41,7 +41,7 @@ help:
 	@echo "  make stop-all      - Остановить все процессы"
 	@echo "  make force-stop    - Принудительно остановить процессы проекта"
 	@echo "  make kill-safe     - Безопасная остановка только bot.py и app.py"
-	@echo "  make kill-remake   - Остановить только процессы TeleBlast в $(PROJECT_DIR)"
+	@echo "  make kill-teleblast   - Остановить все процессы TeleBlast в $(PROJECT_DIR)"
 	@echo "  make cleanup-pids  - Очистить устаревшие pidfiles"
 	@echo "  make start-all     - Запустить бота и веб-панель"
 
@@ -369,7 +369,7 @@ kill-safe:
 	@echo "$(GREEN)✅ Безопасная остановка завершена$(NC)"
 	@$(MAKE) status
 
-kill-remake:
+kill-teleblast:
 	@echo "$(RED)🚨 Останавливаем только TeleBlast (cwd=$(PROJECT_DIR))...$(NC)"
 	@found="no"; \
 	for pid in $$(pgrep -f "python.*bot.py" 2>/dev/null || true); do \

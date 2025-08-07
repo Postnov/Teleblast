@@ -27,13 +27,22 @@ WEBAPP_USERNAME = os.getenv("WEBAPP_USERNAME")
 WEBAPP_PASSWORD = os.getenv("WEBAPP_PASSWORD")
 WEBAPP_SECRET_KEY = os.getenv("WEBAPP_SECRET_KEY")
 
-required_vars = {
+# Проверяем только обязательные переменные для бота
+required_bot_vars = {
     'BOT_TOKEN': BOT_TOKEN,
     'DATABASE_PATH': DATABASE_PATH,
+}
+missing_bot = [k for k, v in required_bot_vars.items() if not v]
+if missing_bot:
+    raise RuntimeError(f"Missing required environment variables for bot: {', '.join(missing_bot)}")
+
+# Проверяем переменные веб-приложения только если они используются
+webapp_vars = {
     'WEBAPP_USERNAME': WEBAPP_USERNAME,
     'WEBAPP_PASSWORD': WEBAPP_PASSWORD,
     'WEBAPP_SECRET_KEY': WEBAPP_SECRET_KEY,
 }
-missing = [k for k, v in required_vars.items() if not v]
-if missing:
-    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}") 
+missing_webapp = [k for k, v in webapp_vars.items() if not v]
+if missing_webapp:
+    print(f"⚠️  Переменные веб-приложения не настроены: {', '.join(missing_webapp)}")
+    print("   Веб-интерфейс будет недоступен. Для его работы добавьте эти переменные в .env файл") 
