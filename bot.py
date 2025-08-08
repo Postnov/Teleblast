@@ -3,6 +3,58 @@ import logging
 from typing import List, Optional
 
 import os
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# ---- Helpers ---- #
+
+def now_msk_naive() -> datetime:
+    """Возвращает текущее время в МСК без tzinfo (naive)"""
+    return datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+
+def to_msk_naive(dt: datetime) -> datetime:
+    """Приводит произвольный datetime к МСК и делает его naive (без tzinfo)."""
+    if dt.tzinfo is not None:
+        return dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    return dt
+
+def utc_str_to_msk_str(dt_str: str) -> str:
+    """Парсит строку времени (UTC или без tz) и возвращает строку в МСК в формате DD.MM.YYYY HH:MM.
+
+    Для записей SQLite CURRENT_TIMESTAMP (UTC) без tzinfo принудительно считаем UTC.
+    """
+    if not dt_str:
+        return "-"
+    try:
+        # fromisoformat поддерживает и ' ' и 'T' как разделитель даты и времени
+        dt = datetime.fromisoformat(dt_str)
+    except Exception:
+        # Последняя попытка: заменить пробел на 'T'
+        try:
+            dt = datetime.fromisoformat(dt_str.replace(" ", "T"))
+        except Exception:
+            return dt_str
+    # Если tz отсутствует, считаем это UTC (как CURRENT_TIMESTAMP в SQLite)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    msk = dt.astimezone(ZoneInfo("Europe/Moscow"))
+    return msk.strftime('%d.%m.%Y %H:%M')
+
+def format_scheduled_str(scheduled_at_str: str) -> str:
+    """Красиво форматирует scheduled_at, хранящийся как ISO-строка.
+    Если есть tzinfo — приводим к МСК, иначе считаем, что это уже МСК (naive).
+    """
+    if not scheduled_at_str:
+        return "не задано"
+    try:
+        dt = datetime.fromisoformat(scheduled_at_str)
+    except Exception:
+        return scheduled_at_str
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+    # Считаем, что naive уже в МСК
+    return dt.strftime('%d.%m.%Y %H:%M')
+import dateparser
 import re
 import aiosqlite
 from dotenv import load_dotenv
@@ -155,6 +207,8 @@ db = Database(DATABASE_PATH)
 class BroadcastState(StatesGroup):
     waiting_for_message = State()
     waiting_for_list_choice = State()
+    waiting_for_schedule_input = State()
+    waiting_for_schedule_confirm = State()
 
 
 class MenuState(StatesGroup):
@@ -182,6 +236,7 @@ class MenuState(StatesGroup):
     # управление рассылками
     broadcast_menu = State()
     broadcast_manage_show = State()
+    broadcast_manage_edit_time = State()
 
     # --- редактирование группы ---
     edit_search = State()
@@ -262,6 +317,50 @@ async def build_lists_keyboard() -> InlineKeyboardMarkup:
     ]
     keyboard.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+# ---- Отправка запланированной рассылки ---- #
+async def send_broadcast_by_id(broadcast_id: int):
+    """Отправляет рассылку во все группы и отмечает её как отправленную"""
+    # Получаем данные рассылки
+    cursor = await db.conn.execute(
+        "SELECT list_id, source_chat_id, source_message_id FROM broadcasts WHERE id = ?",
+        (broadcast_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        logging.error(f"Broadcast {broadcast_id} not found")
+        return
+    list_id, source_chat_id, source_message_id = row
+
+    # Получаем все группы сегмента
+    groups = await db.get_groups_in_list(list_id)
+    sent = 0
+    for chat_id in groups:
+        try:
+            sent_message = await bot.copy_message(chat_id, from_chat_id=source_chat_id, message_id=source_message_id)
+            await db.record_broadcast_message(broadcast_id, chat_id, sent_message.message_id)
+            sent += 1
+        except Exception as e:
+            logging.error(f"Не удалось отправить в {chat_id}: {e}")
+    # Отмечаем как отправленную только если хоть куда-то ушло
+    if sent > 0:
+        await db.mark_broadcast_as_sent(broadcast_id)
+    logging.info(f"Broadcast {broadcast_id} sent to {sent} groups")
+
+
+async def broadcast_scheduler():
+    """Фоновая задача, проверяющая и запускающая запланированные рассылки"""
+    while True:
+        try:
+            now_msk = now_msk_naive()
+            due = await db.get_due_broadcasts(now_msk)
+            for row in due:
+                b_id = row[0]
+                await send_broadcast_by_id(b_id)
+        except Exception as e:
+            logging.error(f"Scheduler error: {e}")
+        await asyncio.sleep(30)
 
 
 async def send_long_message_with_keyboard(message: types.Message, text: str, reply_markup: Optional[ReplyKeyboardMarkup] = None, chunk_size: int = 4000):
@@ -383,35 +482,25 @@ async def process_list_choice(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Источник сообщения не найден", show_alert=True)
         return
 
-    # Записываем рассылку в БД
+    # Создаём запись о рассылке (пока без даты)
     broadcast_id = await db.record_broadcast(
         list_id=list_id,
         content_type=source.content_type,
         content=source.text or None,
+        scheduled_at=None,
+        source_chat_id=source.chat.id,
+        source_message_id=source.message_id,
     )
 
-    groups = await db.get_groups_in_list(list_id)
-    sent = 0
-    for chat_id in groups:
-        try:
-            sent_message = await source.copy_to(chat_id, disable_web_page_preview=True)
-            await db.record_broadcast_message(broadcast_id, chat_id, sent_message.message_id)
-            sent += 1
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение в {chat_id}: {e}")
+    # Сохраняем в FSM
+    await state.update_data(broadcast_id=broadcast_id)
 
     await callback.answer()
-    await callback.message.answer(f"✅ Сообщение отправлено в {sent} групп(ы).")
-
-    # Кнопка быстрого удаления
-    delete_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🗑 Удалить рассылку", callback_data=f"delete_broadcast:{broadcast_id}")]
-        ]
+    await callback.message.answer(
+        "Когда отправить рассылку? Укажите дату и время (по МСК).\n"\
+        "Примеры: 13.08.2025 17:00, 13 августа 17:00, через 2 дня 5 вечера, сейчас"
     )
-    await callback.message.answer("При необходимости можно удалить рассылку:", reply_markup=delete_kb)
-
-    await state.clear()
+    await state.set_state(BroadcastState.waiting_for_schedule_input)
 
 
 @dp.callback_query(F.data == "cancel")
@@ -421,6 +510,102 @@ async def cancel_callback(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("⛔️ Рассылка отменена.")
     await callback.answer()
 
+
+# ---- Шаг ввода времени ---- #
+@dp.message(BroadcastState.waiting_for_schedule_input)
+async def process_schedule_input(message: types.Message, state: FSMContext):
+    text = message.text.strip().lower()
+    # Обработка "сейчас"
+    if text in ["сейчас", "now"]:
+        scheduled_dt = datetime.now(ZoneInfo("Europe/Moscow"))
+    else:
+        scheduled_dt = dateparser.parse(
+            text,
+            languages=["ru"],
+            settings={
+                "RELATIVE_BASE": datetime.now(ZoneInfo("Europe/Moscow")),
+                "TIMEZONE": "Europe/Moscow",
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+    if not scheduled_dt:
+        await message.answer("Не удалось распознать дату/время. Попробуйте ещё раз.")
+        return
+    # Если дата без года и она уже прошла – добавляем год +1
+    if scheduled_dt < now_msk_naive():
+        # Оставляем как есть, пользователь возможно хочет прошлое время для немедленного запуска
+        pass
+
+    await state.update_data(scheduled_dt=scheduled_dt)
+
+    # Подтверждение
+    confirm_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data="schedule_confirm"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
+            ]
+        ]
+    )
+    await message.answer(
+        f"Опубликовать рассылку {scheduled_dt.strftime('%d.%m.%Y %H:%M')} по МСК?",
+        reply_markup=confirm_kb,
+    )
+    await state.set_state(BroadcastState.waiting_for_schedule_confirm)
+
+
+# ---- Подтверждение времени ---- #
+@dp.callback_query(F.data == "schedule_confirm")
+async def confirm_schedule_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    broadcast_id = data.get("broadcast_id")
+    scheduled_dt: datetime = data.get("scheduled_dt")
+    if not broadcast_id or not scheduled_dt:
+        await callback.answer("Данные потеряны", show_alert=True)
+        await state.clear()
+        return
+    # Получаем исходные данные для источника сообщения
+    row = await db.conn.execute("SELECT source_chat_id, source_message_id FROM broadcasts WHERE id = ?", (broadcast_id,))
+    src = await row.fetchone()
+    if not src:
+        await callback.answer("Рассылка не найдена", show_alert=True)
+        await state.clear()
+        return
+    source_chat_id, source_message_id = src
+    await db.set_broadcast_schedule(broadcast_id, scheduled_dt, source_chat_id, source_message_id)
+
+    # Если время уже пришло – отправляем сразу
+    if scheduled_dt <= now_msk_naive():
+        await send_broadcast_by_id(broadcast_id)
+        await callback.message.answer("✅ Рассылка отправлена сразу, так как указанное время уже наступило.")
+    else:
+        await callback.message.answer(
+            f"✅ Рассылка запланирована на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК)",
+        )
+
+    await state.clear()
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "edit_schedule_confirm")
+async def confirm_edit_schedule_callback(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    b_id = data.get("edit_broadcast_id")
+    dt: datetime = data.get("edit_new_dt")
+    if not b_id or not dt:
+        await callback.answer("Данные потеряны", show_alert=True)
+        await state.clear()
+        return
+    row = await db.conn.execute("SELECT source_chat_id, source_message_id FROM broadcasts WHERE id = ?", (b_id,))
+    src = await row.fetchone()
+    if not src:
+        await callback.answer("Рассылка не найдена", show_alert=True)
+        await state.clear()
+        return
+    await db.set_broadcast_schedule(b_id, dt, src[0], src[1])
+    await callback.message.answer(f"✅ Время рассылки обновлено на {dt.strftime('%d.%m.%Y %H:%M')} (МСК)")
+    await state.clear()
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("delete_broadcast"))
 async def delete_broadcast_callback(callback: types.CallbackQuery):
@@ -439,6 +624,24 @@ async def delete_broadcast_callback(callback: types.CallbackQuery):
     
     await callback.message.answer(f"🗑 Удалено {deleted} сообщений. Рассылка помечена как удаленная.")
     await callback.answer()
+
+
+# Команда для повторной отправки рассылки админом
+@dp.message(Command("resend"))
+@admin_required
+async def cmd_resend(message: types.Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Формат: /resend <id>")
+        return
+    try:
+        b_id = int(command.args.strip())
+    except ValueError:
+        await message.answer("ID должен быть числом")
+        return
+    # сбрасываем флаг, чтобы планировщик не игнорировал
+    await db.reset_broadcast_sent_flag(b_id)
+    await send_broadcast_by_id(b_id)
+    await message.answer(f"♻️ Перезапуск рассылки #{b_id} выполнен")
 
 
 @dp.message(Command("delete_last"))
@@ -646,7 +849,7 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
             return
         
         cursor = await db.conn.execute(
-            "SELECT date, content_type, content, list_id, deleted FROM broadcasts WHERE id = ?",
+            "SELECT date, scheduled_at, sent, content_type, content, list_id, deleted FROM broadcasts WHERE id = ?",
             (b_id,)
         )
         row = await cursor.fetchone()
@@ -654,22 +857,27 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
             await message.answer("Рассылка не найдена.")
             return
 
-        date, ctype, content, list_id, deleted = row
+        date, scheduled_at, sent_flag, ctype, content, list_id, deleted = row
         seg_row = await db.conn.execute("SELECT name FROM lists WHERE id = ?", (list_id,))
         seg = await seg_row.fetchone()
         seg_name = seg[0] if seg else "-"
 
         preview = (content or "[non-text]")[:200]
-        status_text = "🗑 <b>УДАЛЕНА</b>" if deleted else "✅ <b>Активна</b>"
+        status_text = "🗑 <b>УДАЛЕНА</b>" if deleted else ("✅ <b>Отправлена</b>" if sent_flag else "⏳ <b>Запланирована</b>")
+        schedule_info = format_scheduled_str(scheduled_at) if scheduled_at else "не задано"
+        created_info = utc_str_to_msk_str(date) if isinstance(date, str) else str(date)
         text = (
             f"📰 <b>Рассылка #{b_id}</b>\n"
-            f"📅 {date}\n"
+            f"📅 Создана: {created_info}\n"
+            f"⏰ Расписание: {schedule_info}\n"
             f"📂 Сегмент: <b>{seg_name}</b>\n"
             f"📊 Статус: {status_text}\n\n"
             f"<i>Содержимое:</i> {preview}"
         )
 
         kb = ReplyKeyboardBuilder()
+        if not deleted and not sent_flag:
+            kb.button(text="⏰ Изменить время")
         # Показываем кнопку удаления только для активных рассылок
         if not deleted:
             kb.button(text="🗑 Удалить рассылку")
@@ -693,6 +901,17 @@ async def process_broadcast_manage(message: types.Message, state: FSMContext):
         # возвращаемся к списку рассылок
         await handle_broadcast_button(message, state)
         return
+    if message.text == "⏰ Изменить время":
+        b_id = (await state.get_data()).get("manage_broadcast_id")
+        if not b_id:
+            await message.answer("ID рассылки потерян.")
+            await state.clear()
+            return
+        await state.update_data(edit_broadcast_id=b_id)
+        await message.answer("Введите новую дату/время для рассылки (МСК):")
+        await state.set_state(MenuState.broadcast_manage_edit_time)
+        return
+
     if message.text == "🗑 Удалить рассылку":
         data = await state.get_data()
         b_id = data.get("manage_broadcast_id")
@@ -718,6 +937,41 @@ async def process_broadcast_manage(message: types.Message, state: FSMContext):
         return
 
     await message.answer("Используйте кнопки управления рассылкой.")
+
+
+# ---- Изменение времени рассылки ---- #
+@dp.message(MenuState.broadcast_manage_edit_time)
+@admin_required
+async def process_broadcast_edit_time(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    dt = dateparser.parse(
+        text,
+        languages=["ru"],
+        settings={
+            "RELATIVE_BASE": now_msk_naive(),
+            "TIMEZONE": "Europe/Moscow",
+            "RETURN_AS_TIMEZONE_AWARE": False,
+        },
+    )
+    if not dt:
+        await message.answer("Не удалось распознать дату/время. Попробуйте ещё раз.")
+        return
+    data = await state.get_data()
+    b_id = data.get("edit_broadcast_id")
+    if not b_id:
+        await message.answer("ID рассылки потерян.")
+        await state.clear()
+        return
+
+    # Сохраняем выбранное время в FSM и спрашиваем подтверждение
+    await state.update_data(edit_new_dt=dt)
+    confirm_kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="edit_schedule_confirm"), InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]]
+    )
+    await message.answer(
+        f"Подтвердить новое время: {dt.strftime('%d.%m.%Y %H:%M')} (МСК)?",
+        reply_markup=confirm_kb,
+    )
 
 
 # Сегменты
@@ -1717,6 +1971,9 @@ async def main():
             logger.info(f"Перенесено {len(ADMIN_IDS)} админов из конфига в базу данных")
 
 
+
+        # Запускаем планировщик рассылок
+        asyncio.create_task(broadcast_scheduler())
 
         logger.info("🚀 Бот запускается...")
         await dp.start_polling(bot)

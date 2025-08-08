@@ -1,5 +1,6 @@
 import aiosqlite
-from typing import Optional
+from typing import Optional, List, Tuple
+from datetime import datetime
 
 class Database:
     def __init__(self, path: str):
@@ -41,6 +42,10 @@ class Database:
             content_type TEXT,
             content TEXT,
             date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            scheduled_at TIMESTAMP,
+            sent INTEGER DEFAULT 0,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
             deleted INTEGER DEFAULT 0
         )
         """)
@@ -65,6 +70,8 @@ class Database:
         await self.conn.commit()
         # Проверяем и добавляем поле super_admin если его нет
         await self._migrate_add_super_admin_field()
+        # Проверяем и добавляем поля планирования рассылок если их нет
+        await self._migrate_add_schedule_fields()
 
     async def _migrate_add_deleted_field(self):
         """Миграция для добавления поля deleted в таблицу broadcasts"""
@@ -80,6 +87,32 @@ class Database:
                 print("✅ Поле 'deleted' добавлено в таблицу broadcasts")
         except Exception as e:
             print(f"❌ Ошибка миграции: {e}")
+
+    async def _migrate_add_schedule_fields(self):
+        """Миграция для добавления полей планирования в broadcasts"""
+        try:
+            cursor = await self.conn.execute("PRAGMA table_info(broadcasts)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            # scheduled_at
+            if 'scheduled_at' not in column_names:
+                await self.conn.execute("ALTER TABLE broadcasts ADD COLUMN scheduled_at TIMESTAMP")
+                print("✅ Поле 'scheduled_at' добавлено в таблицу broadcasts")
+            # sent flag
+            if 'sent' not in column_names:
+                await self.conn.execute("ALTER TABLE broadcasts ADD COLUMN sent INTEGER DEFAULT 0")
+                print("✅ Поле 'sent' добавлено в таблицу broadcasts")
+            # source_chat_id
+            if 'source_chat_id' not in column_names:
+                await self.conn.execute("ALTER TABLE broadcasts ADD COLUMN source_chat_id INTEGER")
+                print("✅ Поле 'source_chat_id' добавлено в таблицу broadcasts")
+            # source_message_id
+            if 'source_message_id' not in column_names:
+                await self.conn.execute("ALTER TABLE broadcasts ADD COLUMN source_message_id INTEGER")
+                print("✅ Поле 'source_message_id' добавлено в таблицу broadcasts")
+            await self.conn.commit()
+        except Exception as e:
+            print(f"❌ Ошибка миграции schedule_fields: {e}")
 
     async def _migrate_add_super_admin_field(self):
         """Миграция для добавления поля super_admin в таблицу admins"""
@@ -121,10 +154,26 @@ class Database:
         rows = await cursor.fetchall()
         return [row[0] for row in rows]
 
-    async def record_broadcast(self, list_id: int, content_type: str, content: Optional[str]):
+    async def record_broadcast(
+        self,
+        list_id: int,
+        content_type: str,
+        content: Optional[str],
+        scheduled_at: Optional[datetime] = None,
+        source_chat_id: Optional[int] = None,
+        source_message_id: Optional[int] = None,
+    ):
+        """Создаёт запись о рассылке и возвращает её ID"""
         cursor = await self.conn.execute(
-            "INSERT INTO broadcasts(list_id, content_type, content) VALUES (?, ?, ?)",
-            (list_id, content_type, content),
+            "INSERT INTO broadcasts(list_id, content_type, content, scheduled_at, source_chat_id, source_message_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                list_id,
+                content_type,
+                content,
+                scheduled_at.isoformat() if scheduled_at else None,
+                source_chat_id,
+                source_message_id,
+            ),
         )
         await self.conn.commit()
         return cursor.lastrowid
@@ -135,6 +184,33 @@ class Database:
             (broadcast_id, chat_id, message_id),
         )
         await self.conn.commit()
+
+    # ---- Scheduling helper methods ---- #
+
+    async def set_broadcast_schedule(self, broadcast_id: int, scheduled_at: datetime, source_chat_id: int, source_message_id: int):
+        """Устанавливает время отправки и источник сообщения для рассылки"""
+        await self.conn.execute(
+            "UPDATE broadcasts SET scheduled_at = ?, source_chat_id = ?, source_message_id = ? WHERE id = ?",
+            (scheduled_at.isoformat(), source_chat_id, source_message_id, broadcast_id)
+        )
+        await self.conn.commit()
+
+    async def mark_broadcast_as_sent(self, broadcast_id: int):
+        await self.conn.execute("UPDATE broadcasts SET sent = 1 WHERE id = ?", (broadcast_id,))
+        await self.conn.commit()
+
+    async def reset_broadcast_sent_flag(self, broadcast_id: int):
+        """Сбрасывает флаг отправки, чтобы можно было повторить рассылку"""
+        await self.conn.execute("UPDATE broadcasts SET sent = 0 WHERE id = ?", (broadcast_id,))
+        await self.conn.commit()
+
+    async def get_due_broadcasts(self, before_dt: datetime) -> List[Tuple]:
+        """Получить все рассылки, запланированные до указанного момента и ещё не отправленные"""
+        cursor = await self.conn.execute(
+            "SELECT id, list_id, content_type, content, source_chat_id, source_message_id FROM broadcasts WHERE sent = 0 AND deleted = 0 AND scheduled_at IS NOT NULL AND scheduled_at <= ?",
+            (before_dt.isoformat(),)
+        )
+        return await cursor.fetchall()
 
     async def get_last_broadcast_id(self):
         cursor = await self.conn.execute("SELECT id FROM broadcasts ORDER BY id DESC LIMIT 1")
