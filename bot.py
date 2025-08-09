@@ -1,3 +1,39 @@
+def _append_edit_content_handler():
+    @dp.message(MenuState.broadcast_edit_content_wait)
+    @admin_required
+    async def process_broadcast_edit_content(message: types.Message, state: FSMContext):
+        data = await state.get_data()
+        b_id = data.get("edit_broadcast_id") or data.get("manage_broadcast_id")
+        if not b_id:
+            await message.answer("ID рассылки потерян.")
+            await state.clear()
+            return
+        new_text = message.text
+        if not new_text:
+            await message.answer("Нужно отправить текстовое сообщение.")
+            return
+
+        # Обновляем контент для будущих отправок
+        await db.update_broadcast_text_content(b_id, new_text)
+
+        # Пытаемся обновить уже отправленные сообщения
+        messages = await db.get_broadcast_messages(b_id)
+        updated = 0
+        for chat_id, msg_id in messages:
+            try:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=new_text, disable_web_page_preview=True)
+                updated += 1
+            except Exception as e:
+                logger.error(f"Не удалось изменить сообщение {msg_id} в {chat_id}: {e}")
+        # Определяем статус рассылки
+        row = await db.conn.execute("SELECT sent FROM broadcasts WHERE id = ?", (b_id,))
+        r = await row.fetchone()
+        is_sent = bool(r and r[0])
+        if not is_sent:
+            await message.answer("✅ Содержимое обновлено.", reply_markup=admin_reply_keyboard())
+        else:
+            await message.answer(f"✅ Содержимое обновлено в {updated} группах", reply_markup=admin_reply_keyboard())
+        await state.clear()
 import asyncio
 import logging
 from typing import List, Optional
@@ -54,6 +90,31 @@ def format_scheduled_str(scheduled_at_str: str) -> str:
         dt = dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
     # Считаем, что naive уже в МСК
     return dt.strftime('%d.%m.%Y %H:%M')
+
+def extract_hours(user_text: str) -> Optional[int]:
+    """Пытается извлечь число часов из текста: '2', '2ч', '2 часа', 'через 2 часа'.
+    Возвращает None, если распознать как часы нельзя."""
+    import re as _re
+    text = user_text.strip().lower()
+    m = _re.match(r"^(?:через\s*)?(\d{1,2})(?:\s*(?:ч|час|часа|часов))?\s*$", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+def extract_minutes(user_text: str) -> Optional[int]:
+    """Извлекает количество минут: '40', '40 мин', '40 минут', 'через 40 минут'."""
+    import re as _re
+    text = user_text.strip().lower()
+    m = _re.match(r"^(?:через\s*)?(\d{1,3})(?:\s*(?:м|мин|минута|минуты|минут))?\s*$", text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
 import dateparser
 import re
 import aiosqlite
@@ -209,6 +270,8 @@ class BroadcastState(StatesGroup):
     waiting_for_list_choice = State()
     waiting_for_schedule_input = State()
     waiting_for_schedule_confirm = State()
+    waiting_for_auto_delete = State()
+    waiting_for_auto_delete_confirm = State()
 
 
 class MenuState(StatesGroup):
@@ -237,6 +300,7 @@ class MenuState(StatesGroup):
     broadcast_menu = State()
     broadcast_manage_show = State()
     broadcast_manage_edit_time = State()
+    broadcast_edit_content_wait = State()
 
     # --- редактирование группы ---
     edit_search = State()
@@ -358,6 +422,17 @@ async def broadcast_scheduler():
             for row in due:
                 b_id = row[0]
                 await send_broadcast_by_id(b_id)
+            # Автоудаление
+            to_delete = await db.get_due_auto_deletions(now_msk)
+            for (b_id,) in to_delete:
+                # удаляем все сообщения рассылки
+                messages = await db.get_broadcast_messages(b_id)
+                for chat_id, msg_id in messages:
+                    try:
+                        await bot.delete_message(chat_id, msg_id)
+                    except Exception as e:
+                        logging.error(f"Auto delete failed for broadcast {b_id} in {chat_id}: {e}")
+                await db.mark_broadcast_as_deleted(b_id)
         except Exception as e:
             logging.error(f"Scheduler error: {e}")
         await asyncio.sleep(30)
@@ -497,8 +572,14 @@ async def process_list_choice(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.answer()
     await callback.message.answer(
-        "Когда отправить рассылку? Укажите дату и время (по МСК).\n"\
-        "Примеры: 13.08.2025 17:00, 13 августа 17:00, через 2 дня 5 вечера, сейчас"
+        "Когда отправить рассылку? Укажите дату и время (по МСК).\n\n"
+        "Примеры:\n"
+        "— 13.08.2025 17:00\n"
+        "— 13 августа 17:00\n"
+        "— через 2 дня в 17:00\n"
+        "— 5 вечера\n"
+        "— сейчас\n"
+        "— сегодня в 17:00\n"
     )
     await state.set_state(BroadcastState.waiting_for_schedule_input)
 
@@ -574,19 +655,177 @@ async def confirm_schedule_callback(callback: types.CallbackQuery, state: FSMCon
     source_chat_id, source_message_id = src
     await db.set_broadcast_schedule(broadcast_id, scheduled_dt, source_chat_id, source_message_id)
 
-    # Если время уже пришло – отправляем сразу
-    if scheduled_dt <= now_msk_naive():
-        await send_broadcast_by_id(broadcast_id)
-        await callback.message.answer("✅ Рассылка отправлена сразу, так как указанное время уже наступило.")
-    else:
-        await callback.message.answer(
-            f"✅ Рассылка запланирована на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК)",
-        )
-
-    await state.clear()
+    # Переходим к шагу автоудаления
+    await state.update_data(broadcast_id=broadcast_id, scheduled_dt=scheduled_dt)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🚫 Не удалять автоматически", callback_data="auto_del_skip")]]
+    )
+    # Лимит считаем от времени публикации (фактического или планируемого)
+    limit_dt = scheduled_dt + timedelta(hours=48)
+    await callback.message.answer(
+        "Через сколько часов удалить пост?\n" \
+        "— до 48 часов (например: 1, 6, 24)\n" \
+        f"— или укажите дату и время (МСК), не позже чем через 48 часов ({limit_dt.strftime('%d.%m.%Y %H:%M')})\n\n" \
+        "Нажмите кнопку, если не нужно удалять автоматически.",
+        reply_markup=kb,
+    )
+    await state.set_state(BroadcastState.waiting_for_auto_delete)
     await callback.answer()
 
 
+@dp.message(BroadcastState.waiting_for_auto_delete)
+async def process_auto_delete_input(message: types.Message, state: FSMContext):
+    text = message.text.strip().lower()
+    data = await state.get_data()
+    scheduled_dt: datetime = data.get("scheduled_dt")
+    broadcast_id = data.get("broadcast_id")
+    if not broadcast_id:
+        # Фолбэк: пробуем достать из manage_broadcast_id / edit_broadcast_id
+        candidate_id = data.get("manage_broadcast_id") or data.get("edit_broadcast_id")
+        if candidate_id:
+            broadcast_id = candidate_id
+            await state.update_data(broadcast_id=broadcast_id)
+            logger.warning("process_auto_delete_input: восстановил broadcast_id из fallback, id=%s", broadcast_id)
+        else:
+            logger.error("process_auto_delete_input: broadcast_id отсутствует в FSM; data=%s", data)
+            await message.answer("Данные потеряны (нет ID). Начните заново /broadcast")
+            await state.clear()
+            return
+    # Если по какой-то причине scheduled_dt отсутствует в FSM, пробуем достать из БД
+    if scheduled_dt is None:
+        row = await db.conn.execute("SELECT scheduled_at FROM broadcasts WHERE id = ?", (broadcast_id,))
+        r = await row.fetchone()
+        if r and r[0]:
+            try:
+                dt = datetime.fromisoformat(r[0])
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+                scheduled_dt = dt
+            except Exception:
+                scheduled_dt = now_msk_naive()
+        else:
+            scheduled_dt = now_msk_naive()
+
+    max_delta_hours = 48
+    # Максимальное время автоудаления отталкивается от времени публикации
+    max_deadline = scheduled_dt + timedelta(hours=max_delta_hours)
+
+    auto_delete_dt = None
+    hours = extract_hours(text)
+    mins = extract_minutes(text)
+    if hours is not None or mins is not None:
+        total_minutes = (hours or 0) * 60 + (mins or 0)
+        if total_minutes <= 0:
+            await message.answer("Укажите положительное время. Попробуйте ещё раз или нажмите кнопку не удалять.")
+            return
+        if total_minutes > max_delta_hours * 60:
+            await message.answer("Нельзя указывать больше 48 часов. Попробуйте ещё раз.")
+            return
+        auto_delete_dt = scheduled_dt + timedelta(minutes=total_minutes)
+    else:
+        dt = dateparser.parse(
+            text,
+            languages=["ru"],
+            settings={
+                "RELATIVE_BASE": now_msk_naive(),
+                "TIMEZONE": "Europe/Moscow",
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+        if not dt:
+            await message.answer("Не удалось распознать время. Укажите часы/минуты (напр. '2 часа', '40 минут') или дату/время по МСК.")
+            return
+        if dt > max_deadline:
+            await message.answer("Нельзя указывать больше 48 часов от времени публикации. Попробуйте ещё раз.")
+            return
+        auto_delete_dt = dt
+
+    await state.update_data(auto_delete_dt=auto_delete_dt)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="auto_del_confirm"), InlineKeyboardButton(text="❌ Изменить", callback_data="auto_del_change")]]
+    )
+    await message.answer(
+        f"Удалить пост {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)?",
+        reply_markup=kb,
+    )
+    await state.set_state(BroadcastState.waiting_for_auto_delete_confirm)
+
+
+@dp.callback_query(F.data == "auto_del_skip")
+async def auto_delete_skip(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    broadcast_id = data.get("broadcast_id")
+    scheduled_dt: datetime = data.get("scheduled_dt")
+    if not broadcast_id or not scheduled_dt:
+        await callback.answer("Данные потеряны", show_alert=True)
+        await state.clear()
+        return
+    if scheduled_dt <= now_msk_naive():
+        await send_broadcast_by_id(broadcast_id)
+        await callback.message.answer("✅ Пост отправлена сразу. Автоматическое удаление не установлено.")
+    else:
+        await callback.message.answer(
+            f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК) \n🗑️ Автоматическое удаление не установлено.",
+        )
+    # Возвращаем пользователя в меню рассылок, где новая рассылка уже доступна в списке
+    await state.clear()
+    await show_broadcast_menu(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "auto_del_confirm")
+async def auto_delete_confirm(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    broadcast_id = data.get("broadcast_id") or data.get("manage_broadcast_id") or data.get("edit_broadcast_id")
+    scheduled_dt: datetime = data.get("scheduled_dt")
+    auto_delete_dt: datetime = data.get("auto_delete_dt")
+    if scheduled_dt is None:
+        row = await db.conn.execute("SELECT scheduled_at FROM broadcasts WHERE id = ?", (broadcast_id,))
+        r = await row.fetchone()
+        if r and r[0]:
+            try:
+                dt = datetime.fromisoformat(r[0])
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+                scheduled_dt = dt
+            except Exception:
+                scheduled_dt = now_msk_naive()
+        else:
+            scheduled_dt = now_msk_naive()
+    if not broadcast_id or not auto_delete_dt:
+        logger.error("auto_del_confirm: missing data: %s", data)
+        await callback.answer("Данные потеряны", show_alert=True)
+        await state.clear()
+        return
+
+    await db.set_broadcast_auto_delete(broadcast_id, auto_delete_dt)
+
+    if scheduled_dt <= now_msk_naive():
+        await send_broadcast_by_id(broadcast_id)
+        await callback.message.answer(
+            f"✅ Пост отправлен сразу. Автоудаление в {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)."
+        )
+    else:
+        await callback.message.answer(
+            f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК). \n🗑️ Автоудаление в {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)."
+        )
+    # После подтверждения возвращаемся в список рассылок, чтобы сразу была доступна кнопка создания новой
+    await state.clear()
+    await show_broadcast_menu(callback.message, state)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "auto_del_change")
+async def auto_delete_change(callback: types.CallbackQuery, state: FSMContext):
+    # Возвращаем пользователя к повторному вводу времени автоудаления
+    limit_dt = now_msk_naive() + timedelta(hours=48)
+    await callback.message.answer(
+        "Введите время автоудаления ещё раз:\n" \
+        "— до 48 часов (например: 1, 6, 24)\n" \
+        f"— или дата/время по МСК, не позже чем ({limit_dt.strftime('%d.%m.%Y %H:%M')})",
+    )
+    await state.set_state(BroadcastState.waiting_for_auto_delete)
+    await callback.answer()
 @dp.callback_query(F.data == "edit_schedule_confirm")
 async def confirm_edit_schedule_callback(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -603,7 +842,7 @@ async def confirm_edit_schedule_callback(callback: types.CallbackQuery, state: F
         await state.clear()
         return
     await db.set_broadcast_schedule(b_id, dt, src[0], src[1])
-    await callback.message.answer(f"✅ Время рассылки обновлено на {dt.strftime('%d.%m.%Y %H:%M')} (МСК)")
+    await callback.message.answer(f"✅ Время рассылки обновлено на {dt.strftime('%d.%m.%Y %H:%M')} (МСК). Укажите при необходимости автоудаление через /panel → 📢 Рассылка → выбранная рассылка.")
     await state.clear()
     await callback.answer()
 
@@ -784,56 +1023,62 @@ async def handle_back_button(message: types.Message, state: FSMContext):
 
 
 # Рассылка
-@dp.message(F.text == "📢 Рассылка")
-@admin_required
-async def handle_broadcast_button(message: types.Message, state: FSMContext):
-    # Меню рассылок: последние 30 рассылок + новая
+async def show_broadcast_menu(message: types.Message, state: FSMContext):
+    """Показывает меню рассылок без проверки прав (можно вызывать из callback)."""
     all_broadcasts = await db.get_recent_broadcasts_with_message_count(30)
 
     kb = ReplyKeyboardBuilder()
-    
     # Сначала кнопка создания новой рассылки
     kb.button(text="➕ Новая рассылка")
-    
     # Затем список всех рассылок
     for b_id, date, seg_name, ctype, content, message_count, deleted in all_broadcasts:
         content_preview = (content or ctype or "")[:30] + "…"
-        
-        # Формируем информацию о количестве сообщений и статусе
         if deleted:
             msg_info = "удалена"
         elif message_count == 0:
             msg_info = "нет сообщений"
         else:
             msg_info = f"{message_count} сообщений"
-        
         title = f"№{b_id}. {seg_name or 'Без сегмента'}, «{content_preview}» ({msg_info})"
         kb.button(text=title)
-
     kb.button(text="⬅️ Назад")
     kb.adjust(1)
-        
     txt_lines = ["📢 Управление рассылками"]
     if all_broadcasts:
         txt_lines.append(f"Показаны последние {len(all_broadcasts)} рассылок")
         txt_lines.append("Выберите рассылку для управления или создайте новую.")
     else:
         txt_lines.append("Пока нет рассылок. Создайте первую!")
-
-    # Отправляем через send_long_message_with_keyboard для длинных списков
     await send_long_message_with_keyboard(
-        message, 
-        "\n".join(txt_lines), 
-        reply_markup=kb.as_markup(resize_keyboard=True)
+        message,
+        "\n".join(txt_lines),
+        reply_markup=kb.as_markup(resize_keyboard=True),
     )
     await state.set_state(MenuState.broadcast_menu)
+
+
+@dp.message(F.text == "📢 Рассылка")
+@admin_required
+async def handle_broadcast_button(message: types.Message, state: FSMContext):
+    await show_broadcast_menu(message, state)
 
 # ----- Меню управления рассылками ----- #
 
 @dp.message(MenuState.broadcast_menu)
 @admin_required
 async def process_broadcast_menu(message: types.Message, state: FSMContext):
+    # Если в меню рассылок пользователь сразу присылает сообщение (текст/медиа),
+    # воспринимаем это как создание новой рассылки без нажатия кнопки
+    if message.content_type != "text":
+        await broadcast_save_message(message, state)
+        return
+
     txt = message.text or ""
+    if txt not in ("⬅️ Назад", "➕ Новая рассылка") and not txt.startswith("№") and txt.strip():
+        # Текст, который не является кнопкой и не выбором рассылки —
+        # трактуем как сообщение новой рассылки
+        await broadcast_save_message(message, state)
+        return
     if txt == "⬅️ Назад":
         await state.clear()
         await message.answer("🏠 Вернулись в главное меню", reply_markup=admin_reply_keyboard())
@@ -849,7 +1094,7 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
             return
         
         cursor = await db.conn.execute(
-            "SELECT date, scheduled_at, sent, content_type, content, list_id, deleted FROM broadcasts WHERE id = ?",
+            "SELECT date, scheduled_at, sent, content_type, content, list_id, deleted, auto_delete_at FROM broadcasts WHERE id = ?",
             (b_id,)
         )
         row = await cursor.fetchone()
@@ -857,7 +1102,7 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
             await message.answer("Рассылка не найдена.")
             return
 
-        date, scheduled_at, sent_flag, ctype, content, list_id, deleted = row
+        date, scheduled_at, sent_flag, ctype, content, list_id, deleted, auto_delete_at = row
         seg_row = await db.conn.execute("SELECT name FROM lists WHERE id = ?", (list_id,))
         seg = await seg_row.fetchone()
         seg_name = seg[0] if seg else "-"
@@ -865,11 +1110,13 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
         preview = (content or "[non-text]")[:200]
         status_text = "🗑 <b>УДАЛЕНА</b>" if deleted else ("✅ <b>Отправлена</b>" if sent_flag else "⏳ <b>Запланирована</b>")
         schedule_info = format_scheduled_str(scheduled_at) if scheduled_at else "не задано"
+        auto_del_info = format_scheduled_str(auto_delete_at) if auto_delete_at else "не установлено"
         created_info = utc_str_to_msk_str(date) if isinstance(date, str) else str(date)
         text = (
             f"📰 <b>Рассылка #{b_id}</b>\n"
             f"📅 Создана: {created_info}\n"
-            f"⏰ Расписание: {schedule_info}\n"
+            f"⏰ Публикация: {schedule_info}\n"
+            f"🧹 Автоудаление: {auto_del_info}\n"
             f"📂 Сегмент: <b>{seg_name}</b>\n"
             f"📊 Статус: {status_text}\n\n"
             f"<i>Содержимое:</i> {preview}"
@@ -877,10 +1124,15 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
 
         kb = ReplyKeyboardBuilder()
         if not deleted and not sent_flag:
-            kb.button(text="⏰ Изменить время")
-        # Показываем кнопку удаления только для активных рассылок
+            kb.button(text="⏰ Изменить время публикации")
+        # Кнопки управления автоудалением
         if not deleted:
-            kb.button(text="🗑 Удалить рассылку")
+            if auto_delete_at:
+                kb.button(text="🗑️ Изменить время удаления")
+            else:
+                kb.button(text="🧹 Установить время удаления")
+            kb.button(text="❌ Удалить рассылку")
+            kb.button(text="✏️ Изменить содержимое")
         kb.button(text="⬅️ Назад")
         kb.adjust(1)
 
@@ -901,7 +1153,7 @@ async def process_broadcast_manage(message: types.Message, state: FSMContext):
         # возвращаемся к списку рассылок
         await handle_broadcast_button(message, state)
         return
-    if message.text == "⏰ Изменить время":
+    if message.text in ("⏰ Изменить время", "⏰ Изменить время публикации"):
         b_id = (await state.get_data()).get("manage_broadcast_id")
         if not b_id:
             await message.answer("ID рассылки потерян.")
@@ -910,6 +1162,50 @@ async def process_broadcast_manage(message: types.Message, state: FSMContext):
         await state.update_data(edit_broadcast_id=b_id)
         await message.answer("Введите новую дату/время для рассылки (МСК):")
         await state.set_state(MenuState.broadcast_manage_edit_time)
+        return
+
+    if message.text in ("🧹 Установить время удаления", "🧹 Изменить время удаления", "🗑️ Изменить время удаления"):
+        b_id = (await state.get_data()).get("manage_broadcast_id")
+        if not b_id:
+            await message.answer("ID рассылки потерян.")
+            await state.clear()
+            return
+        # Берём scheduled_at из БД, чтобы считать лимит от времени публикации
+        row = await db.conn.execute("SELECT scheduled_at FROM broadcasts WHERE id = ?", (b_id,))
+        r = await row.fetchone()
+        scheduled_dt = None
+        if r and r[0]:
+            try:
+                dt = datetime.fromisoformat(r[0])
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+                scheduled_dt = dt
+            except Exception:
+                scheduled_dt = None
+        await state.update_data(broadcast_id=b_id, scheduled_dt=scheduled_dt)
+        limit_dt = (scheduled_dt or now_msk_naive()) + timedelta(hours=48)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🚫 Не удалять автоматически", callback_data="auto_del_skip")]]
+        )
+        await message.answer(
+            "Через сколько часов удалить пост?\n" \
+            "— до 48 часов (например: 1, 6, 24)\n" \
+            f"— или укажите дату и время (МСК), не позже чем через 48 часов ({limit_dt.strftime('%d.%m.%Y %H:%M')})\n\n" \
+            "Нажмите кнопку, если не нужно удалять автоматически.",
+            reply_markup=kb,
+        )
+        await state.set_state(BroadcastState.waiting_for_auto_delete)
+        return
+
+    if message.text == "✏️ Изменить содержимое":
+        b_id = (await state.get_data()).get("manage_broadcast_id")
+        if not b_id:
+            await message.answer("ID рассылки потерян.")
+            await state.clear()
+            return
+        await state.update_data(edit_broadcast_id=b_id)
+        await message.answer("Отправьте новый текст для замены содержимого поста.")
+        await state.set_state(MenuState.broadcast_edit_content_wait)
         return
 
     if message.text == "🗑 Удалить рассылку":
@@ -1987,6 +2283,8 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        # зарегистрируем динамический обработчик
+        _append_edit_content_handler()
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("🛑 Бот остановлен!")

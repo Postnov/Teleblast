@@ -46,6 +46,7 @@ class Database:
             sent INTEGER DEFAULT 0,
             source_chat_id INTEGER,
             source_message_id INTEGER,
+            auto_delete_at TIMESTAMP,
             deleted INTEGER DEFAULT 0
         )
         """)
@@ -110,6 +111,10 @@ class Database:
             if 'source_message_id' not in column_names:
                 await self.conn.execute("ALTER TABLE broadcasts ADD COLUMN source_message_id INTEGER")
                 print("✅ Поле 'source_message_id' добавлено в таблицу broadcasts")
+            # auto_delete_at
+            if 'auto_delete_at' not in column_names:
+                await self.conn.execute("ALTER TABLE broadcasts ADD COLUMN auto_delete_at TIMESTAMP")
+                print("✅ Поле 'auto_delete_at' добавлено в таблицу broadcasts")
             await self.conn.commit()
         except Exception as e:
             print(f"❌ Ошибка миграции schedule_fields: {e}")
@@ -204,6 +209,22 @@ class Database:
         await self.conn.execute("UPDATE broadcasts SET sent = 0 WHERE id = ?", (broadcast_id,))
         await self.conn.commit()
 
+    async def set_broadcast_auto_delete(self, broadcast_id: int, auto_delete_at: Optional[datetime]):
+        """Устанавливает время автоудаления (или None для отключения)"""
+        await self.conn.execute(
+            "UPDATE broadcasts SET auto_delete_at = ? WHERE id = ?",
+            (auto_delete_at.isoformat() if auto_delete_at else None, broadcast_id)
+        )
+        await self.conn.commit()
+
+    async def get_due_auto_deletions(self, before_dt: datetime) -> List[Tuple]:
+        """Получить рассылки, требующие автоудаления к указанному моменту"""
+        cursor = await self.conn.execute(
+            "SELECT id FROM broadcasts WHERE sent = 1 AND deleted = 0 AND auto_delete_at IS NOT NULL AND auto_delete_at <= ?",
+            (before_dt.isoformat(),)
+        )
+        return await cursor.fetchall()
+
     async def get_due_broadcasts(self, before_dt: datetime) -> List[Tuple]:
         """Получить все рассылки, запланированные до указанного момента и ещё не отправленные"""
         cursor = await self.conn.execute(
@@ -211,6 +232,14 @@ class Database:
             (before_dt.isoformat(),)
         )
         return await cursor.fetchall()
+
+    async def update_broadcast_text_content(self, broadcast_id: int, new_text: str):
+        """Обновляет поле content у рассылки. Тип контента не меняем."""
+        await self.conn.execute(
+            "UPDATE broadcasts SET content = ? WHERE id = ?",
+            (new_text, broadcast_id)
+        )
+        await self.conn.commit()
 
     async def get_last_broadcast_id(self):
         cursor = await self.conn.execute("SELECT id FROM broadcasts ORDER BY id DESC LIMIT 1")
