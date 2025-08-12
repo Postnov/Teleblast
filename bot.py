@@ -723,11 +723,13 @@ async def process_auto_delete_input(message: types.Message, state: FSMContext):
             return
         auto_delete_dt = scheduled_dt + timedelta(minutes=total_minutes)
     else:
+        # Относительные формулировки (например, "через час") должны считаться
+        # от времени публикации, а не от текущего времени
         dt = dateparser.parse(
             text,
             languages=["ru"],
             settings={
-                "RELATIVE_BASE": now_msk_naive(),
+                "RELATIVE_BASE": scheduled_dt or now_msk_naive(),
                 "TIMEZONE": "Europe/Moscow",
                 "RETURN_AS_TIMEZONE_AWARE": False,
             },
@@ -762,10 +764,10 @@ async def auto_delete_skip(callback: types.CallbackQuery, state: FSMContext):
         return
     if scheduled_dt <= now_msk_naive():
         await send_broadcast_by_id(broadcast_id)
-        await callback.message.answer("✅ Пост отправлена сразу. Автоматическое удаление не установлено.")
+        await callback.message.answer("✅ Пост отправлена сразу. Автоматическое удаление нет.")
     else:
         await callback.message.answer(
-            f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК) \n🗑️ Автоматическое удаление не установлено.",
+            f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК) \n🗑️ Автоматическое удаления нет.",
         )
     # Возвращаем пользователя в меню рассылок, где новая рассылка уже доступна в списке
     await state.clear()
