@@ -558,10 +558,18 @@ async def process_list_choice(callback: types.CallbackQuery, state: FSMContext):
         return
 
     # Создаём запись о рассылке (пока без даты)
+    # Извлекаем текст в зависимости от типа сообщения
+    text_content = None
+    if source.content_type == "text":
+        text_content = source.text
+    else:
+        # Для медиа-сообщений текст содержится в caption
+        text_content = source.caption
+        
     broadcast_id = await db.record_broadcast(
         list_id=list_id,
         content_type=source.content_type,
-        content=source.text or None,
+        content=text_content,
         scheduled_at=None,
         source_chat_id=source.chat.id,
         source_message_id=source.message_id,
@@ -1109,8 +1117,66 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
         seg = await seg_row.fetchone()
         seg_name = seg[0] if seg else "-"
 
-        preview = (content or "[non-text]")[:200]
-        status_text = "🗑 <b>УДАЛЕНА</b>" if deleted else ("✅ <b>Отправлена</b>" if sent_flag else "⏳ <b>Запланирована</b>")
+        # Формируем красивый preview с указанием типа контента
+        def format_content_preview(content_type: str, text_content: str) -> str:
+            """Форматирует preview содержимого рассылки в зависимости от типа"""
+            
+            # Определяем тип контента и emoji
+            type_names = {
+                "text": "Текст",
+                "photo": "Изображение",
+                "video": "Видео", 
+                "video_note": "Видеосообщение",
+                "voice": "Голосовое сообщение",
+                "audio": "Аудио",
+                "document": "Документ",
+                "animation": "GIF",
+                "sticker": "Стикер",
+                "location": "Геолокация",
+                "contact": "Контакт"
+            }
+            
+            type_name = type_names.get(content_type, "Сообщение")
+            
+            if not text_content:
+                # Если нет текста, показываем только тип
+                return f"{type_name}"
+            else:
+                # Если есть текст, показываем тип + первые 50 символов
+                short_text = text_content[:50]
+                if len(text_content) > 50:
+                    short_text += "..."
+                    
+                if content_type == "text":
+                    return f"«{short_text}»"
+                else:
+                    return f"{type_name} и текст: «{short_text}»"
+        
+        preview = format_content_preview(ctype, content)
+        
+        # Определяем статус рассылки с учётом времени
+        if deleted:
+            status_text = "🗑 <b>УДАЛЕНА</b>"
+        elif sent_flag:
+            status_text = "✅ <b>Отправлена</b>"
+        else:
+            # Рассылка не отправлена
+            if not scheduled_at:
+                status_text = "📝 <b>Черновик</b>"
+            else:
+                # Парсим время из строки и сравниваем с текущим временем
+                try:
+                    from datetime import datetime
+                    scheduled_dt = datetime.fromisoformat(scheduled_at) if isinstance(scheduled_at, str) else scheduled_at
+                    current_time = now_msk_naive()
+                    
+                    if scheduled_dt <= current_time:
+                        status_text = "❌ <b>Просрочена</b>"
+                    else:
+                        status_text = "⏳ <b>Запланирована</b>"
+                except Exception:
+                    # Если что-то пошло не так с парсингом времени
+                    status_text = "⏳ <b>Запланирована</b>"
         schedule_info = format_scheduled_str(scheduled_at) if scheduled_at else "не задано"
         auto_del_info = format_scheduled_str(auto_delete_at) if auto_delete_at else "не установлено"
         created_info = utc_str_to_msk_str(date) if isinstance(date, str) else str(date)
