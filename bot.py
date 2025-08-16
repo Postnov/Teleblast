@@ -793,13 +793,21 @@ async def auto_delete_skip(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Данные потеряны", show_alert=True)
         await state.clear()
         return
-    if scheduled_dt <= now_msk_naive():
-        await send_broadcast_by_id(broadcast_id)
-        await callback.message.answer("✅ Пост отправлена сразу. Автоматическое удаление нет.")
+    # Узнаём, был ли пост уже отправлен
+    row = await db.conn.execute("SELECT sent FROM broadcasts WHERE id = ?", (broadcast_id,))
+    r = await row.fetchone()
+    is_sent = bool(r and r[0])
+
+    if is_sent:
+        await callback.message.answer("🧹 Автоудаление отключено. Пост уже был отправлен ранее.")
     else:
-        await callback.message.answer(
-            f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК) \n🗑️ Автоматическое удаления нет.",
-        )
+        if scheduled_dt <= now_msk_naive():
+            await send_broadcast_by_id(broadcast_id)
+            await callback.message.answer("✅ Пост отправлен сразу. Автоудаление: нет.")
+        else:
+            await callback.message.answer(
+                f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК).\n🗑️ Автоудаление: нет.",
+            )
     # Возвращаем пользователя в меню рассылок, где новая рассылка уже доступна в списке
     await state.clear()
     await show_broadcast_menu(callback.message, state)
@@ -833,15 +841,25 @@ async def auto_delete_confirm(callback: types.CallbackQuery, state: FSMContext):
 
     await db.set_broadcast_auto_delete(broadcast_id, auto_delete_dt)
 
-    if scheduled_dt <= now_msk_naive():
-        await send_broadcast_by_id(broadcast_id)
+    # Узнаём, был ли пост уже отправлен
+    row = await db.conn.execute("SELECT sent FROM broadcasts WHERE id = ?", (broadcast_id,))
+    r = await row.fetchone()
+    is_sent = bool(r and r[0])
+
+    if is_sent:
         await callback.message.answer(
-            f"✅ Пост отправлен сразу. Автоудаление в {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)."
+            f"🗑️ Автоудаление установлено: {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК). Пост уже был отправлен ранее."
         )
     else:
-        await callback.message.answer(
-            f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК). \n🗑️ Автоудаление в {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)."
-        )
+        if scheduled_dt <= now_msk_naive():
+            await send_broadcast_by_id(broadcast_id)
+            await callback.message.answer(
+                f"✅ Пост отправлен сразу. Автоудаление в {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)."
+            )
+        else:
+            await callback.message.answer(
+                f"✅ Пост запланирован на {scheduled_dt.strftime('%d.%m.%Y %H:%M')} (МСК).\n🗑️ Автоудаление в {auto_delete_dt.strftime('%d.%m.%Y %H:%M')} (МСК)."
+            )
     # После подтверждения возвращаемся в список рассылок, чтобы сразу была доступна кнопка создания новой
     await state.clear()
     await show_broadcast_menu(callback.message, state)
