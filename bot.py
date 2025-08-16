@@ -684,6 +684,29 @@ async def confirm_schedule_callback(callback: types.CallbackQuery, state: FSMCon
 @dp.message(BroadcastState.waiting_for_auto_delete)
 async def process_auto_delete_input(message: types.Message, state: FSMContext):
     text = message.text.strip().lower()
+    
+    # Обрабатываем команды навигации
+    if text in ("назад", "⬅️ назад", "отмена", "❌", "cancel"):
+        data = await state.get_data()
+        broadcast_id = data.get("broadcast_id") or data.get("manage_broadcast_id") or data.get("edit_broadcast_id")
+        
+        if broadcast_id:
+            # Проверяем, откуда мы пришли: из создания рассылки или из управления
+            if data.get("manage_broadcast_id"):
+                # Пришли из управления существующей рассылкой - возвращаемся к экрану управления
+                await state.update_data(manage_broadcast_id=broadcast_id)
+                await state.set_state(MenuState.broadcast_manage_show)
+                await show_broadcast_manage_screen(message, state, broadcast_id)
+            else:
+                # Пришли из создания новой рассылки - возвращаемся в меню рассылок
+                await state.clear()
+                await handle_broadcast_button(message, state)
+        else:
+            # Если ID потерян, возвращаемся в главное меню
+            await state.clear()
+            await message.answer("🏠 Вернулись в главное меню", reply_markup=admin_reply_keyboard())
+        return
+    
     data = await state.get_data()
     scheduled_dt: datetime = data.get("scheduled_dt")
     broadcast_id = data.get("broadcast_id")
@@ -1072,6 +1095,116 @@ async def show_broadcast_menu(message: types.Message, state: FSMContext):
 async def handle_broadcast_button(message: types.Message, state: FSMContext):
     await show_broadcast_menu(message, state)
 
+# ----- Функция для отображения экрана управления рассылкой ----- #
+
+async def show_broadcast_manage_screen(message: types.Message, state: FSMContext, broadcast_id: int):
+    """Отображает экран управления конкретной рассылкой"""
+    cursor = await db.conn.execute(
+        "SELECT date, scheduled_at, sent, content_type, content, list_id, deleted, auto_delete_at FROM broadcasts WHERE id = ?",
+        (broadcast_id,)
+    )
+    row = await cursor.fetchone()
+    if not row:
+        await message.answer("Рассылка не найдена.")
+        return
+
+    date, scheduled_at, sent_flag, ctype, content, list_id, deleted, auto_delete_at = row
+    seg_row = await db.conn.execute("SELECT name FROM lists WHERE id = ?", (list_id,))
+    seg = await seg_row.fetchone()
+    seg_name = seg[0] if seg else "-"
+
+    # Формируем красивый preview с указанием типа контента
+    def format_content_preview(content_type: str, text_content: str) -> str:
+        """Форматирует preview содержимого рассылки в зависимости от типа"""
+        
+        # Определяем тип контента и emoji
+        type_names = {
+            "text": "Текст",
+            "photo": "Изображение",
+            "video": "Видео", 
+            "video_note": "Видеосообщение",
+            "voice": "Голосовое сообщение",
+            "audio": "Аудио",
+            "document": "Документ",
+            "animation": "GIF",
+            "sticker": "Стикер",
+            "location": "Геолокация",
+            "contact": "Контакт"
+        }
+        
+        type_name = type_names.get(content_type, "Сообщение")
+        
+        if not text_content:
+            # Если нет текста, показываем только тип
+            return f"{type_name}"
+        else:
+            # Если есть текст, показываем тип + первые 50 символов
+            short_text = text_content[:50]
+            if len(text_content) > 50:
+                short_text += "..."
+                
+            if content_type == "text":
+                return f"«{short_text}»"
+            else:
+                return f"{type_name} и текст: «{short_text}»"
+    
+    preview = format_content_preview(ctype, content)
+    
+    # Определяем статус рассылки с учётом времени
+    if deleted:
+        status_text = "🗑 <b>УДАЛЕНА</b>"
+    elif sent_flag:
+        status_text = "✅ <b>Отправлена</b>"
+    else:
+        # Рассылка не отправлена
+        if not scheduled_at:
+            status_text = "📝 <b>Черновик</b>"
+        else:
+            # Парсим время из строки и сравниваем с текущим временем
+            try:
+                from datetime import datetime
+                scheduled_dt = datetime.fromisoformat(scheduled_at) if isinstance(scheduled_at, str) else scheduled_at
+                current_time = now_msk_naive()
+                
+                if scheduled_dt <= current_time:
+                    status_text = "❌ <b>Просрочена</b>"
+                else:
+                    status_text = "⏳ <b>Запланирована</b>"
+            except Exception:
+                # Если что-то пошло не так с парсингом времени
+                status_text = "⏳ <b>Запланирована</b>"
+    
+    schedule_info = format_scheduled_str(scheduled_at) if scheduled_at else "не задано"
+    auto_del_info = format_scheduled_str(auto_delete_at) if auto_delete_at else "не установлено"
+    created_info = utc_str_to_msk_str(date) if isinstance(date, str) else str(date)
+    text = (
+        f"📰 <b>Рассылка #{broadcast_id}</b>\n"
+        f"📅 Создана: {created_info}\n"
+        f"⏰ Публикация: {schedule_info}\n"
+        f"🧹 Автоудаление: {auto_del_info}\n"
+        f"📂 Сегмент: <b>{seg_name}</b>\n"
+        f"📊 Статус: {status_text}\n\n"
+        f"<i>Содержимое:</i> {preview}"
+    )
+
+    kb = ReplyKeyboardBuilder()
+    if not deleted and not sent_flag:
+        kb.button(text="⏰ Изменить время публикации")
+    # Кнопки управления автоудалением
+    if not deleted and not sent_flag:
+        if auto_delete_at:
+            kb.button(text="🗑️ Изменить время удаления")
+        else:
+            kb.button(text="🧹 Установить время удаления")
+        kb.button(text="❌ Удалить рассылку")
+        kb.button(text="✏️ Изменить содержимое")
+    kb.button(text="⬅️ Назад")
+    kb.adjust(1)
+
+    await message.answer(text, reply_markup=kb.as_markup(resize_keyboard=True))
+    await state.update_data(manage_broadcast_id=broadcast_id)
+    await state.set_state(MenuState.broadcast_manage_show)
+
 # ----- Меню управления рассылками ----- #
 
 @dp.message(MenuState.broadcast_menu)
@@ -1103,110 +1236,7 @@ async def process_broadcast_menu(message: types.Message, state: FSMContext):
             await message.answer("Неверный формат номера рассылки.")
             return
         
-        cursor = await db.conn.execute(
-            "SELECT date, scheduled_at, sent, content_type, content, list_id, deleted, auto_delete_at FROM broadcasts WHERE id = ?",
-            (b_id,)
-        )
-        row = await cursor.fetchone()
-        if not row:
-            await message.answer("Рассылка не найдена.")
-            return
-
-        date, scheduled_at, sent_flag, ctype, content, list_id, deleted, auto_delete_at = row
-        seg_row = await db.conn.execute("SELECT name FROM lists WHERE id = ?", (list_id,))
-        seg = await seg_row.fetchone()
-        seg_name = seg[0] if seg else "-"
-
-        # Формируем красивый preview с указанием типа контента
-        def format_content_preview(content_type: str, text_content: str) -> str:
-            """Форматирует preview содержимого рассылки в зависимости от типа"""
-            
-            # Определяем тип контента и emoji
-            type_names = {
-                "text": "Текст",
-                "photo": "Изображение",
-                "video": "Видео", 
-                "video_note": "Видеосообщение",
-                "voice": "Голосовое сообщение",
-                "audio": "Аудио",
-                "document": "Документ",
-                "animation": "GIF",
-                "sticker": "Стикер",
-                "location": "Геолокация",
-                "contact": "Контакт"
-            }
-            
-            type_name = type_names.get(content_type, "Сообщение")
-            
-            if not text_content:
-                # Если нет текста, показываем только тип
-                return f"{type_name}"
-            else:
-                # Если есть текст, показываем тип + первые 50 символов
-                short_text = text_content[:50]
-                if len(text_content) > 50:
-                    short_text += "..."
-                    
-                if content_type == "text":
-                    return f"«{short_text}»"
-                else:
-                    return f"{type_name} и текст: «{short_text}»"
-        
-        preview = format_content_preview(ctype, content)
-        
-        # Определяем статус рассылки с учётом времени
-        if deleted:
-            status_text = "🗑 <b>УДАЛЕНА</b>"
-        elif sent_flag:
-            status_text = "✅ <b>Отправлена</b>"
-        else:
-            # Рассылка не отправлена
-            if not scheduled_at:
-                status_text = "📝 <b>Черновик</b>"
-            else:
-                # Парсим время из строки и сравниваем с текущим временем
-                try:
-                    from datetime import datetime
-                    scheduled_dt = datetime.fromisoformat(scheduled_at) if isinstance(scheduled_at, str) else scheduled_at
-                    current_time = now_msk_naive()
-                    
-                    if scheduled_dt <= current_time:
-                        status_text = "❌ <b>Просрочена</b>"
-                    else:
-                        status_text = "⏳ <b>Запланирована</b>"
-                except Exception:
-                    # Если что-то пошло не так с парсингом времени
-                    status_text = "⏳ <b>Запланирована</b>"
-        schedule_info = format_scheduled_str(scheduled_at) if scheduled_at else "не задано"
-        auto_del_info = format_scheduled_str(auto_delete_at) if auto_delete_at else "не установлено"
-        created_info = utc_str_to_msk_str(date) if isinstance(date, str) else str(date)
-        text = (
-            f"📰 <b>Рассылка #{b_id}</b>\n"
-            f"📅 Создана: {created_info}\n"
-            f"⏰ Публикация: {schedule_info}\n"
-            f"🧹 Автоудаление: {auto_del_info}\n"
-            f"📂 Сегмент: <b>{seg_name}</b>\n"
-            f"📊 Статус: {status_text}\n\n"
-            f"<i>Содержимое:</i> {preview}"
-        )
-
-        kb = ReplyKeyboardBuilder()
-        if not deleted and not sent_flag:
-            kb.button(text="⏰ Изменить время публикации")
-        # Кнопки управления автоудалением
-        if not deleted:
-            if auto_delete_at:
-                kb.button(text="🗑️ Изменить время удаления")
-            else:
-                kb.button(text="🧹 Установить время удаления")
-            kb.button(text="❌ Удалить рассылку")
-            kb.button(text="✏️ Изменить содержимое")
-        kb.button(text="⬅️ Назад")
-        kb.adjust(1)
-
-        await message.answer(text, reply_markup=kb.as_markup(resize_keyboard=True))
-        await state.update_data(manage_broadcast_id=b_id)
-        await state.set_state(MenuState.broadcast_manage_show)
+        await show_broadcast_manage_screen(message, state, b_id)
         return
     
     await message.answer("Пожалуйста, используйте кнопки.")
