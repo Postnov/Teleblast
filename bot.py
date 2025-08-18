@@ -606,13 +606,14 @@ async def process_schedule_input(message: types.Message, state: FSMContext):
     text = message.text.strip().lower()
     # Обработка "сейчас"
     if text in ["сейчас", "now"]:
-        scheduled_dt = datetime.now(ZoneInfo("Europe/Moscow"))
+        # Всегда используем наивное время в МСК, чтобы избежать сравнений aware vs naive
+        scheduled_dt = now_msk_naive()
     else:
         scheduled_dt = dateparser.parse(
             text,
             languages=["ru"],
             settings={
-                "RELATIVE_BASE": datetime.now(ZoneInfo("Europe/Moscow")),
+                "RELATIVE_BASE": now_msk_naive(),
                 "TIMEZONE": "Europe/Moscow",
                 "RETURN_AS_TIMEZONE_AWARE": False,
             },
